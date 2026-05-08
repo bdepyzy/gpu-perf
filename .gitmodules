@@ -1,0 +1,3 @@
+[submodule "KernelBench-Hard"]
+	path = KernelBench-Hard
+	url = https://github.com/Infatoshi/KernelBench-Hard.git
