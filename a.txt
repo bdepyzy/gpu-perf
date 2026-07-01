@@ -1,0 +1,7 @@
+torch nvidia-cutlass-dsl numpy matplotlib pandas requests rich pytest scipy seaborn duckdb nvidia-ml-py pynvml vllm sglang
+
+# 3. Clone key repos
+git clone https://github.com/NVIDIA/cutlass.git ~/cutlass
+git clone https://github.com/vllm-project/vllm.git ~/vllm
+git clone https://github.com/sgl-project/sglang.git ~/sglang
+git clone https://github.com/NVIDIA/nccl-tests.git ~/nccl-tests
