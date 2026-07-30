@@ -18,7 +18,7 @@ def run():
     BM = 128
     BN = 128
     # K values staged per shared-memory tile
-    BK = 16
+    BK = 32
     # C rows and columns computed by one thread
     TM = 8
     TN = 8
@@ -44,41 +44,52 @@ def run():
                 acc[(mi, ni)] = cutlass.Float32(0.0)
 
 
-        # Current shared-memory tile layout
-        sA_layout = cute.make_layout((BM, BK), stride=(BK, 1))
+        # sA swizzle: 16B chunks (M=3, 8 fp16) XORed with row bits 3-4
+        # (offset bits [3,5) ^= [8,10)) so the two half-warps of a warp
+        # (rows m and m+8) hit different banks. sB needs none: 128-bit
+        # fragment loads make each quarter-warp touch all 32 banks once.
+        sA_layout = cute.make_composed_layout(
+            cute.make_swizzle(2, 3, 5),
+            0,
+            cute.make_layout((BM, BK), stride=(BK, 1)),
+        )
         sB_layout = cute.make_layout((BK, BN), stride=(BN, 1))
         smem = SmemAllocator()
 
         sA = smem.allocate_tensor(gA.element_type, sA_layout, byte_alignment=16)
         sB = smem.allocate_tensor(gB.element_type, sB_layout, byte_alignment=16)
 
+        tid = ty * TX + tx
+
+        # 16-byte vector copies gmem -> smem (8 fp16 per atom).
+        # A tile: 4 threads per row (32 elems = 4 vecs), 64 rows per pass.
+        atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gA.element_type, num_bits_per_copy=128)
+        copy_A = cute.make_tiled_copy_tv(atom, cute.make_layout((64, 4), stride=(4, 1)), cute.make_layout((1, 8)))
+        # B tile: 16 threads per row (128 elems = 16 vecs), 16 rows per pass.
+        copy_B = cute.make_tiled_copy_tv(atom, cute.make_layout((16, 16), stride=(16, 1)), cute.make_layout((1, 8)))
+        thrA = copy_A.get_slice(tid)
+        thrB = copy_B.get_slice(tid)
+        tAsA = thrA.partition_D(sA)
+        tBsB = thrB.partition_D(sB)
+
+        # Per-k register fragments of the micro-tile
+        a_frag = cute.make_rmem_tensor((TM, 1), gA.element_type)
+        b_frag = cute.make_rmem_tensor((1, TN), gB.element_type)
+
         for k0 in range(0, Kdim, BK):
-            tid = TX * ty + tx
-            threads = TY * TX
-
-            for load in cutlass.range_constexpr((BM * BK) // threads):
-                s_idx = tid + load * threads
-                s_row = s_idx // BK
-                s_col = s_idx % BK
-                sA[(s_row, s_col)] = gA[(bidy * BM + s_row, k0 + s_col)]
-
-            for load in cutlass.range_constexpr((BK * BN) // threads):
-                s_idx = tid + load * threads
-                s_row = s_idx // BN
-                s_col = s_idx % BN
-                sB[(s_row, s_col)] = gB[(k0 + s_row, bidx * BN + s_col)]
+            gA_tile = cute.local_tile(gA, (BM, BK), (bidy, k0 // BK))
+            gB_tile = cute.local_tile(gB, (BK, BN), (k0 // BK, bidx))
+            cute.copy(atom, thrA.partition_S(gA_tile), tAsA)
+            cute.copy(atom, thrB.partition_S(gB_tile), tBsB)
             cute.arch.sync_threads()
 
             for k in cutlass.range_constexpr(BK):
+                cute.autovec_copy(cute.local_tile(sA, (TM, 1), (ty, k)), a_frag)
+                cute.autovec_copy(cute.local_tile(sB, (1, TN), (k, tx)), b_frag)
                 for mi in cutlass.range_constexpr(TM):
-
-                    a = cutlass.Float32(sA[(ty * TM + mi, k)])
-
+                    a = cutlass.Float32(a_frag[(mi, 0)])
                     for ni in cutlass.range_constexpr(TN):
-
-                        b = cutlass.Float32(sB[(k, tx * TN + ni)])
-
-                        acc[(mi, ni)] = acc[(mi, ni)] + a * b
+                        acc[(mi, ni)] = acc[(mi, ni)] + a * cutlass.Float32(b_frag[(0, ni)])
             cute.arch.sync_threads()
 
         for mi in cutlass.range_constexpr(TM):
