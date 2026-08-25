@@ -1,9 +1,12 @@
 [project]
 name = "learn-kernels"
 version = "0.1.0"
-description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "modal>=1.5.3",
+    "einops==0.8.2",
+    "modal>=1.5.4",
+    "nvidia-cutlass-dsl[cu13]==4.7.0",
+    "numpy==2.5.2",
+    "torch==2.11.0",
 ]
