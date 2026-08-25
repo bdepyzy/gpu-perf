@@ -56,3 +56,14 @@ class Model(nn.Module):
             self._compiled = cute.compile(_topk, x_, v_, i_)
         self._compiled(x_, v_, i_)
         return values, indices
+
+    def prepare_for_bench(self, inputs):
+        x = inputs[0]
+        values = torch.empty(self.batch, self.k, device=x.device, dtype=torch.float32)
+        indices = torch.empty(self.batch, self.k, device=x.device, dtype=torch.int64)
+        x_ = from_dlpack(x, assumed_align=16)
+        v_ = from_dlpack(values, assumed_align=16)
+        i_ = from_dlpack(indices, assumed_align=16)
+        if self._compiled is None:
+            self._compiled = cute.compile(_topk, x_, v_, i_)
+        return lambda: self._compiled(x_, v_, i_)

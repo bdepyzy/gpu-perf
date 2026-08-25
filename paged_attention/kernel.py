@@ -90,13 +90,30 @@ class Model(nn.Module):
     def forward(self, query: torch.Tensor, kv_cache: torch.Tensor, block_table: torch.Tensor, seq_lens: torch.Tensor) -> torch.Tensor:
         B, H, D = query.shape
         out = torch.empty(B, H, D, dtype=query.dtype, device=query.device)
-        q_ = from_dlpack(query, assumed_align=16)
-        kv_ = from_dlpack(kv_cache, assumed_align=16)
-        bt_ = from_dlpack(block_table, assumed_align=16)
-        sl_ = from_dlpack(seq_lens, assumed_align=16)
-        o_ = from_dlpack(out, assumed_align=16)
-        scale = cutlass.Float32(self.scale)
+        args = (
+            from_dlpack(query, assumed_align=16),
+            from_dlpack(kv_cache, assumed_align=16),
+            from_dlpack(block_table, assumed_align=16),
+            from_dlpack(seq_lens, assumed_align=16),
+            from_dlpack(out, assumed_align=16),
+            cutlass.Float32(self.scale),
+        )
         if self._compiled is None:
-            self._compiled = cute.compile(_attn, q_, kv_, bt_, sl_, o_, scale)
-        self._compiled(q_, kv_, bt_, sl_, o_, scale)
+            self._compiled = cute.compile(_attn, *args)
+        self._compiled(*args)
         return out
+
+    def prepare_for_bench(self, inputs):
+        query = inputs[0]
+        out = torch.empty(query.shape[0], query.shape[1], query.shape[2], dtype=query.dtype, device=query.device)
+        args = (
+            from_dlpack(query, assumed_align=16),
+            from_dlpack(inputs[1], assumed_align=16),
+            from_dlpack(inputs[2], assumed_align=16),
+            from_dlpack(inputs[3], assumed_align=16),
+            from_dlpack(out, assumed_align=16),
+            cutlass.Float32(self.scale),
+        )
+        if self._compiled is None:
+            self._compiled = cute.compile(_attn, *args)
+        return lambda: self._compiled(*args)

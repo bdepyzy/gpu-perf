@@ -54,15 +54,17 @@ app = modal.App(f"bench-{WORKLOAD or 'workload'}", image=image)
 
 
 @app.function(gpu=B200_GPU, timeout=B200_TIMEOUT)
-def run(workload: str):
+def run(workload: str, check: bool = False):
     common.configure_root(REMOTE_ROOT)
+    if check:
+        common.set_check_only(True)
     module = importlib.import_module(MODULES[workload])
     module.evaluate(workload)
 
 
 @app.local_entrypoint()
-def main():
+def main(check: bool = False):
     if WORKLOAD is None:
         raise RuntimeError("import benchmark.bench.app from a supported solution file")
-    run.remote(WORKLOAD)
+    run.remote(WORKLOAD, check)
     time.sleep(0.25)

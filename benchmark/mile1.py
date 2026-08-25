@@ -41,15 +41,23 @@ def evaluate(workload):
         torch.add(a, b, out=opponent_output)
         torch.testing.assert_close(output, opponent_output, rtol=1e-3, atol=1e-3)
 
-        solution_us = common.time_cuda(lambda: add(a_cute, b_cute, output_cute))
-        opponent_us = common.time_cuda(lambda: torch.add(a, b, out=opponent_output))
+        shape = f"{rows}x{columns}"
+        if common.CHECK_ONLY:
+            print(f"ok | {shape}", flush=True)
+            continue
+
+        solution_us = common.bench_median(lambda: add(a_cute, b_cute, output_cute))
+        opponent_us = common.bench_median(lambda: torch.add(a, b, out=opponent_output))
         bytes_moved = 3 * rows * columns * 2
         sol_us = common.roofline_us(rows * columns, bytes_moved, "fp32")
         solution_ratios.append(sol_us / solution_us)
         opponent_ratios.append(opponent_us / solution_us)
-        shape = f"{rows}x{columns}"
-        table_rows.append((shape, common.format_time(solution_us), common.format_time(sol_us), common.format_percent(100 * sol_us / solution_us), common.format_time(opponent_us), common.format_percent(100 * opponent_us / solution_us)))
+        table_rows.append((shape, common.format_time(solution_us), common.format_time(sol_us), common.format_percent(100 * sol_us / solution_us), common.format_time(opponent_us), common.format_ratio(opponent_ratios[-1])))
+
+    if common.CHECK_ONLY:
+        print("all shapes correct", flush=True)
+        return
 
     title = f"{torch.cuda.get_device_name()}  |  mile1/{variant}  |  FP16 add"
-    footer = ("Geomean", "", "", common.format_percent(100 * common.geomean(solution_ratios)), "", common.format_percent(100 * common.geomean(opponent_ratios)))
+    footer = ("Geomean", "", "", common.format_percent(100 * common.geomean(solution_ratios)), "", common.format_ratio(common.geomean(opponent_ratios)))
     common.print_table(title, "Opponent: PyTorch CUDA add", ("Shape", "Kernel", "SOL", "SOL eff.", "Opponent", "Perf. vs opp."), table_rows, footer)

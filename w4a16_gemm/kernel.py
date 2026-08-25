@@ -62,3 +62,17 @@ class Model(nn.Module):
             self._compiled = cute.compile(_gemm, x_, w_, s_, z_, c_, gs)
         self._compiled(x_, w_, s_, z_, c_, gs)
         return c
+
+    def prepare_for_bench(self, inputs):
+        c = torch.empty(self.M, self.N, device="cuda", dtype=torch.bfloat16)
+        args = (
+            from_dlpack(inputs[0], assumed_align=16),
+            from_dlpack(self.w_q, assumed_align=16),
+            from_dlpack(self.scales, assumed_align=16),
+            from_dlpack(self.zeros, assumed_align=16),
+            from_dlpack(c, assumed_align=16),
+            cutlass.Int32(self.group_size),
+        )
+        if self._compiled is None:
+            self._compiled = cute.compile(_gemm, *args)
+        return lambda: self._compiled(*args)

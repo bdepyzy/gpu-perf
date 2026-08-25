@@ -12,12 +12,19 @@ ITERATIONS = 30
 ROOT = Path(__file__).resolve().parent.parent
 REFERENCES = Path(__file__).resolve().parent / "references"
 
+# Shared GEMM battery: identical for every GEMM-flavored problem so results
+# are directly comparable. Square M=N=K, power-of-two sizes.
+GEMM_SHAPES = [
+    {"M": size, "N": size, "K": size}
+    for size in (128, 256, 512, 1024, 2048, 4096, 8192)
+]
+
 PROBLEMS = {
     "fp8_gemm": {
         "peak": "fp8",
         "flops": "2*M*N*K",
         "bytes": "M*K + K*N + M*N*2",
-        "tol": 0.15,
+        "tol": 0.05,
     },
     "kda": {
         "peak": "bf16",
@@ -78,6 +85,14 @@ def configure_root(root):
     global ROOT
     ROOT = Path(root)
     sys.path.insert(0, str(ROOT))
+
+
+CHECK_ONLY = False
+
+
+def set_check_only(value):
+    global CHECK_ONLY
+    CHECK_ONLY = value
 
 
 def load(name, path):
@@ -181,6 +196,39 @@ def time_cuda(fn, warmup=WARMUP, iterations=ITERATIONS):
     return start.elapsed_time(end) * 1000 / iterations
 
 
+_L2_FLUSH = None
+
+
+def _flush_l2():
+    global _L2_FLUSH
+    if _L2_FLUSH is None:
+        import torch
+
+        _L2_FLUSH = torch.empty(256 * 1024 * 1024 // 4, dtype=torch.float32, device="cuda")
+    _L2_FLUSH.zero_()
+
+
+def bench_median(fn, warmup=WARMUP, iters=ITERATIONS):
+    """Cold-cache timing: flush L2 before every iteration, return the median."""
+    import statistics
+    import torch
+
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    samples = []
+    for _ in range(iters):
+        _flush_l2()
+        start.record()
+        fn()
+        end.record()
+        end.synchronize()
+        samples.append(start.elapsed_time(end) * 1000.0)
+    return statistics.median(samples)
+
+
 def evaluate_formula(formula, shape):
     return float(eval(formula, {"__builtins__": {}}, shape))
 
@@ -197,6 +245,11 @@ def format_time(time_us):
 
 def format_percent(value):
     return f"{value:.3f}%" if value < 0.1 else f"{value:.1f}%"
+
+
+def format_ratio(ratio):
+    """Speedup vs a baseline: 0.Nx when slower, N.Nx when faster."""
+    return f"{ratio:.3f}x" if ratio < 0.1 else f"{ratio:.2f}x"
 
 
 def format_shape(shape):
@@ -260,17 +313,28 @@ def generic_evaluate(problem, shapes, opponent_factory):
             if not ok:
                 raise RuntimeError(f"{current_opponent} correctness failed | shape={index} | {message}")
 
-        solution_us = time_cuda(lambda: solution_model(*inputs))
-        opponent_us = time_cuda(opponent_fn)
+        if CHECK_ONLY:
+            print(f"ok | {format_shape(shape)}", flush=True)
+            continue
+
+        prepare = getattr(solution_model, "prepare_for_bench", None)
+        solution_call = prepare(inputs) if prepare else (lambda: solution_model(*inputs))
+        with torch.no_grad():
+            solution_us = bench_median(solution_call)
+            opponent_us = bench_median(opponent_fn)
         flops = evaluate_formula(meta["flops"], shape)
         moved = evaluate_formula(meta["bytes"], shape)
         sol_us = roofline_us(flops, moved, meta["peak"])
         sol_ratios.append(sol_us / solution_us)
         opponent_ratios.append(opponent_us / solution_us)
-        rows.append((format_shape(shape), format_time(solution_us), format_time(sol_us), format_percent(100 * sol_us / solution_us), format_time(opponent_us), format_percent(100 * opponent_us / solution_us)))
+        rows.append((format_shape(shape), format_time(solution_us), format_time(sol_us), format_percent(100 * sol_us / solution_us), format_time(opponent_us), format_ratio(opponent_ratios[-1])))
+
+    if CHECK_ONLY:
+        print("all shapes correct", flush=True)
+        return
 
     sol_gmean = geomean(sol_ratios)
     opponent_gmean = geomean(opponent_ratios)
     title = f"{torch.cuda.get_device_name()}  |  {problem}"
-    footer = ("Geomean", "", "", format_percent(100 * sol_gmean), "", format_percent(100 * opponent_gmean))
+    footer = ("Geomean", "", "", format_percent(100 * sol_gmean), "", format_ratio(opponent_gmean))
     print_table(title, f"Opponent: {opponent_name}", ("Shape", "Kernel", "SOL", "SOL eff.", "Opponent", "Perf. vs opp."), rows, footer)

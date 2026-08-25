@@ -1,14 +1,8 @@
-from benchmark.common import generic_evaluate, load
+from benchmark.common import GEMM_SHAPES, generic_evaluate, load
 
 
 DEPS = ("bitsandbytes",)
-SHAPES = [
-    {"M": 1, "N": 2048, "K": 1024},
-    {"M": 8, "N": 2048, "K": 1024},
-    {"M": 32, "N": 2048, "K": 1024},
-    {"M": 1, "N": 4096, "K": 2048},
-    {"M": 16, "N": 3072, "K": 1024},
-]
+SHAPES = GEMM_SHAPES
 
 
 def _opponent(model, inputs, shape, source_dir):

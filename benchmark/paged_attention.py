@@ -2,16 +2,18 @@ import math
 
 import torch
 
+from benchmark import common
 from benchmark.common import (
     PROBLEMS,
+    bench_median,
     compare,
     format_percent,
+    format_ratio,
     format_time,
     make_models,
     print_table,
     problem_modules,
     roofline_us,
-    time_cuda,
     to_cuda,
 )
 
@@ -56,6 +58,14 @@ SHAPES = [
         "num_kv_heads": 4,
         "head_dim": 64,
         "seq_len": 2000,
+        "page_size": 16,
+    },
+    {
+        "batch": 4,
+        "num_heads": 32,
+        "num_kv_heads": 8,
+        "head_dim": 128,
+        "seq_len": 32768,
         "page_size": 16,
     },
 ]
@@ -175,21 +185,33 @@ def evaluate(workload=None):
             if not ok:
                 raise RuntimeError(f"{name} correctness failed | shape={index} | {message}")
 
-        solution_us = time_cuda(lambda: solution_model(*inputs))
-        cudnn_us = time_cuda(baselines.run_cudnn)
-        flashinfer_us = time_cuda(baselines.run_flashinfer)
+        compact = f"B{shape['batch']} H{shape['num_heads']}/{shape['num_kv_heads']} D{shape['head_dim']} L{shape['seq_len']} P{shape['page_size']}"
+
+        if common.CHECK_ONLY:
+            print(f"ok | {compact}", flush=True)
+            continue
+
+        prepare = getattr(solution_model, "prepare_for_bench", None)
+        solution_call = prepare(inputs) if prepare else (lambda: solution_model(*inputs))
+        with torch.no_grad():
+            solution_us = bench_median(solution_call)
+            cudnn_us = bench_median(baselines.run_cudnn)
+            flashinfer_us = bench_median(baselines.run_flashinfer)
         flops = eval(meta["flops"], {"__builtins__": {}}, shape)
         moved = eval(meta["bytes"], {"__builtins__": {}}, shape)
         sol_us = roofline_us(flops, moved, meta["peak"])
         best_us = min(cudnn_us, flashinfer_us)
         sol_ratios.append(sol_us / solution_us)
         library_ratios.append(best_us / solution_us)
-        compact = f"B{shape['batch']} H{shape['num_heads']}/{shape['num_kv_heads']} D{shape['head_dim']} L{shape['seq_len']} P{shape['page_size']}"
         flashinfer_name = baselines.flashinfer_name
-        rows.append((compact, format_time(solution_us), format_time(sol_us), format_percent(100 * sol_us / solution_us), format_time(cudnn_us), format_time(flashinfer_us), format_percent(100 * best_us / solution_us)))
+        rows.append((compact, format_time(solution_us), format_time(sol_us), format_percent(100 * sol_us / solution_us), format_time(cudnn_us), format_time(flashinfer_us), format_ratio(library_ratios[-1])))
+
+    if common.CHECK_ONLY:
+        print("all shapes correct", flush=True)
+        return
 
     sol_gmean = math.exp(sum(math.log(max(x, 1e-9)) for x in sol_ratios) / len(sol_ratios))
     library_gmean = math.exp(sum(math.log(max(x, 1e-9)) for x in library_ratios) / len(library_ratios))
     title = f"{torch.cuda.get_device_name()}  |  paged_attention"
-    footer = ("Geomean", "", "", format_percent(100 * sol_gmean), "", "", format_percent(100 * library_gmean))
+    footer = ("Geomean", "", "", format_percent(100 * sol_gmean), "", "", format_ratio(library_gmean))
     print_table(title, "", ("Shape", "Kernel", "SOL", "SOL eff.", "cuDNN", flashinfer_name, "Perf. vs best"), rows, footer)

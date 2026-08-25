@@ -12,10 +12,11 @@ class Model(nn.Module):
     def __init__(self, M: int, N: int, K: int):
         super().__init__()
         self.M, self.N, self.K = M, N, K
-        # Weights stored as parameters so state_dict is well-defined.
-        # We initialize in bf16 then cast; the fp8 dtype is set by get_inputs.
-        self.weight = nn.Parameter(torch.empty(N, K, dtype=torch.bfloat16))
-        nn.init.normal_(self.weight, std=0.02)
+        # Weights are true fp8_e4m3, stored as parameters so state_dict carries
+        # them across to the agent's solution.
+        w = torch.empty(N, K, dtype=torch.bfloat16)
+        nn.init.normal_(w, std=0.02)
+        self.weight = nn.Parameter(w.to(torch.float8_e4m3fn))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Upcast to bf16 for the naive reference; the kernel equivalent would

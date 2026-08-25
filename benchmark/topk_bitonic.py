@@ -6,10 +6,10 @@ from benchmark.common import generic_evaluate
 DEPS = ()
 SHAPES = [
     {"batch": 1, "n": 32768, "k": 32},
-    {"batch": 32, "n": 4096, "k": 8},
-    {"batch": 16, "n": 8192, "k": 16},
-    {"batch": 8, "n": 6000, "k": 16},
-    {"batch": 64, "n": 2048, "k": 1},
+    {"batch": 1, "n": 131072, "k": 64},
+    {"batch": 8, "n": 131072, "k": 64},
+    {"batch": 32, "n": 131072, "k": 64},
+    {"batch": 8, "n": 262144, "k": 64},
 ]
 
 
