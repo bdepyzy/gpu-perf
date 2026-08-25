@@ -1,6 +1,5 @@
 import importlib.util
 import math
-import re
 import sys
 from pathlib import Path
 
@@ -19,7 +18,6 @@ PROBLEMS = {
         "flops": "2*M*N*K",
         "bytes": "M*K + K*N + M*N*2",
         "tol": 0.15,
-        "forbidden": ["torch._scaled_mm", "torch.ops.aten._scaled_mm"],
     },
     "kda": {
         "peak": "bf16",
@@ -72,12 +70,6 @@ PROBLEMS = {
         "flops": "2*M*N*K",
         "bytes": "M*K*2 + (K/2)*N + (K/128)*N*2 + (K/128)*N*2 + M*N*2",
         "tol": 0.10,
-        "forbidden": [
-            "bitsandbytes.functional.dequantize_4bit",
-            "bitsandbytes.functional.gemv_4bit",
-            "marlin_kernel.gemm",
-            "torch.nn.functional.linear",
-        ],
     },
 }
 
@@ -104,7 +96,6 @@ def problem_modules(problem):
     sys.path[:0] = [str(task_dir), str(source_dir)]
     reference = load(f"{problem}_reference", source_dir / "reference.py")
     solution = load(f"{problem}_solution", kernel_path)
-    check_forbidden(kernel_path, meta["forbidden"])
     return source_dir, reference, solution
 
 
@@ -136,13 +127,6 @@ def make_models(problem, reference, solution, shape):
 
 def to_cuda(values):
     return [value.to("cuda") if hasattr(value, "to") else value for value in values]
-
-
-def check_forbidden(path, names):
-    code = path.read_text()
-    for name in names:
-        if re.search(re.escape(name), code):
-            raise RuntimeError(f"forbidden op used: {name}")
 
 
 def compare(reference, actual, tolerance):

@@ -32,7 +32,6 @@ def _gemm(mA, mB, mC):
 
 class Model(nn.Module):
     """y = (x @ w.T).to(bf16), x fp8_e4m3 (M, K), w bf16 (N, K)."""
-
     def __init__(self, M: int, N: int, K: int):
         super().__init__()
         self.M, self.N, self.K = M, N, K
