@@ -3,3 +3,7 @@
 __pycache__/
 .ruff_cache/
 plan.md
+kda/
+paged_attention/
+topk_bitonic/
+w4a16_gemm/

@@ -12,34 +12,22 @@ VARIANTS = {
     "mile2_tma_pipeline": "tma_pipeline.py",
     "mile2_tcgen": "tcgen.py",
 }
-SHAPES = {
-    "mile2_naive": [
-        (128, 128, 128),
-        (256, 256, 256),
-        (512, 512, 512),
-        (1024, 1024, 1024),
-    ],
-    "mile2_smem_tiled": [
-        (128, 128, 128),
-        (256, 256, 256),
-        (512, 512, 512),
-        (1024, 1024, 1024),
-    ],
-    "mile2_tma_pipeline": [
-        (128, 128, 128),
-        (256, 256, 256),
-        (512, 512, 512),
-        (1024, 1024, 1024),
-    ],
-    # The current tcgen05 lesson supports one K tile and one N tile. Larger K
-    # and N require the next descriptor/epilogue pipeline milestone.
-    "mile2_tcgen": [
-        (128, 128, 64),
-        (256, 128, 64),
-        (512, 128, 64),
-        (1024, 128, 64),
-    ],
-}
+MILE2_SHAPES = [
+    # Square GEMMs.
+    (128, 128, 128),
+    (256, 256, 256),
+    (512, 512, 512),
+    (1024, 1024, 1024),
+    (2048, 2048, 2048),
+    (4096, 4096, 4096),
+    (8192, 8192, 8192),
+    # LLM GEMMs from the Milestone 2 battery. Decode shapes are intentionally
+    # excluded; the dedicated GEMV path comes later in the milestone.
+    (4096, 14336, 4096),
+    (4096, 4096, 14336),
+]
+
+SHAPES = {workload: MILE2_SHAPES for workload in VARIANTS}
 
 
 def evaluate(workload):

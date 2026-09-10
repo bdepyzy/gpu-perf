@@ -54,17 +54,22 @@ app = modal.App(f"bench-{WORKLOAD or 'workload'}", image=image)
 
 
 @app.function(gpu=B200_GPU, timeout=B200_TIMEOUT)
-def run(workload: str, check: bool = False):
+def run(workload: str, check: bool = False, shape: int | None = None):
     common.configure_root(REMOTE_ROOT)
     if check:
         common.set_check_only(True)
     module = importlib.import_module(MODULES[workload])
-    module.evaluate(workload)
+    if shape is not None and workload != "fp8_gemm":
+        raise ValueError("--shape is currently supported only for fp8_gemm")
+    if workload == "fp8_gemm":
+        module.evaluate(workload, shape=shape)
+    else:
+        module.evaluate(workload)
 
 
 @app.local_entrypoint()
-def main(check: bool = False):
+def main(check: bool = False, shape: int | None = None):
     if WORKLOAD is None:
         raise RuntimeError("import benchmark.bench.app from a supported solution file")
-    run.remote(WORKLOAD, check)
+    run.remote(WORKLOAD, check, shape)
     time.sleep(0.25)

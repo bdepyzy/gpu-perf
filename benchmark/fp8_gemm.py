@@ -2,6 +2,9 @@ import math
 import statistics
 
 import torch
+import torch.nn as nn
+from cutlass import cute
+from cutlass.cute.runtime import from_dlpack
 
 from benchmark import common
 from benchmark.common import (
@@ -11,7 +14,6 @@ from benchmark.common import (
     compare,
     format_ratio,
     format_shape,
-    make_models,
     print_table,
     problem_modules,
     to_cuda,
@@ -27,6 +29,46 @@ L2_FLUSH_FLOATS = 256 * 1024 * 1024 // 4
 WARMUP_ITERS = 10
 TIMED_ITERS = 50
 PAD = 16
+
+
+class SolutionAdapter(nn.Module):
+    """Benchmark transport for a solution exporting gemm(mA, mB, mC)."""
+
+    def __init__(self, solution, M: int, N: int, K: int):
+        super().__init__()
+        self.M, self.N, self.K = M, N, K
+        self.weight = nn.Parameter(torch.empty(N, K, dtype=torch.float8_e4m3fn))
+        self.entrypoint = solution.gemm
+        self._compiled = None
+
+    def _callables(self, x):
+        output = torch.empty(self.M, self.N, device=x.device, dtype=torch.bfloat16)
+        args = (
+            from_dlpack(x.view(torch.uint8), assumed_align=16),
+            from_dlpack(self.weight.detach().view(torch.uint8), assumed_align=16),
+            from_dlpack(output, assumed_align=16),
+        )
+        if self._compiled is None:
+            self._compiled = cute.compile(self.entrypoint, *args)
+        return self._compiled, args, output
+
+    def forward(self, x):
+        compiled, args, output = self._callables(x)
+        compiled(*args)
+        return output
+
+    def prepare_for_bench(self, inputs):
+        compiled, args, _ = self._callables(inputs[0])
+        return lambda: compiled(*args)
+
+
+def _make_models(reference, solution, shape):
+    common.apply_shape(PROBLEM, reference, shape)
+    init_args = reference.get_init_inputs()
+    reference_model = reference.Model(*init_args).to("cuda").eval()
+    solution_model = SolutionAdapter(solution, *init_args).to("cuda").eval()
+    solution_model.load_state_dict(reference_model.state_dict(), strict=True)
+    return reference_model, solution_model
 
 
 def _solution_fn(model, inputs):
@@ -69,15 +111,21 @@ def _bench(fn, l2_flush, warmup=WARMUP_ITERS, iters=TIMED_ITERS):
     return statistics.median(samples)
 
 
-def evaluate(workload=None):
+def evaluate(workload=None, shape=None):
     source_dir, reference, solution = problem_modules(PROBLEM)
     peak_tflops = B200_PEAK_TFLOPS["fp8"]
     l2_flush = torch.empty(L2_FLUSH_FLOATS, dtype=torch.float32, device="cuda")
     rows = []
     speedups = []
+    shapes = SHAPES
+    if shape is not None:
+        shapes = [candidate for candidate in SHAPES if candidate == {"M": shape, "N": shape, "K": shape}]
+        if not shapes:
+            available = ", ".join(str(candidate["M"]) for candidate in SHAPES)
+            raise ValueError(f"unknown square shape {shape}; available sizes: {available}")
 
-    for shape in SHAPES:
-        reference_model, solution_model = make_models(PROBLEM, reference, solution, shape)
+    for problem_shape in shapes:
+        reference_model, solution_model = _make_models(reference, solution, problem_shape)
         torch.manual_seed(2026)
         torch.cuda.manual_seed_all(2026)
         inputs = to_cuda(reference.get_inputs())
@@ -86,7 +134,7 @@ def evaluate(workload=None):
             sol_out = solution_model(*inputs)
         ok, message = compare(ref_out, sol_out, TOLERANCE)
         if not ok:
-            raise RuntimeError(f"solution correctness failed | {format_shape(shape)} | {message}")
+            raise RuntimeError(f"solution correctness failed | {format_shape(problem_shape)} | {message}")
 
         opponent_fn = None
         opp_us = None
@@ -98,16 +146,16 @@ def evaluate(workload=None):
             if math.isfinite(rel) and rel < 0.05:
                 opponent_fn = candidate
             else:
-                print(f"cuBLASLt FP8 skipped | {format_shape(shape)} | rel_fro={rel:.4f}")
+                print(f"cuBLASLt FP8 skipped | {format_shape(problem_shape)} | rel_fro={rel:.4f}")
         except RuntimeError as error:
-            print(f"cuBLASLt FP8 skipped | {format_shape(shape)} | {error}")
+            print(f"cuBLASLt FP8 skipped | {format_shape(problem_shape)} | {error}")
 
-        m, n, k = shape["M"], shape["N"], shape["K"]
+        m, n, k = problem_shape["M"], problem_shape["N"], problem_shape["K"]
         flops = 2 * m * n * k
         moved_bytes = m * k + k * n + m * n * 2
 
         if common.CHECK_ONLY:
-            print(f"ok | {format_shape(shape)}", flush=True)
+            print(f"ok | {format_shape(problem_shape)}", flush=True)
             continue
 
         sol_us = _bench(_solution_fn(solution_model, inputs), l2_flush)
@@ -121,7 +169,7 @@ def evaluate(workload=None):
         speedups.append(speedup)
         rows.append(
             (
-                format_shape(shape),
+                format_shape(problem_shape),
                 f"{sol_us:.2f} us",
                 f"{tflops:,.1f}",
                 f"{pct_peak:.2f}%",
