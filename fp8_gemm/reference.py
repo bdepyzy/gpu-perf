@@ -1,10 +1,6 @@
 import torch
 import torch.nn as nn
 
-OP_TYPE = "gemm"
-SUPPORTED_PRECISIONS = ["fp8_e4m3"]
-HARDWARE_REQUIRED = ["RTX_PRO_6000", "H100", "B200"]
-
 
 class Model(nn.Module):
     """y = (x @ w.T).to(bf16), where x is fp8_e4m3 (M, K), w is fp8_e4m3 (N, K)."""
@@ -12,11 +8,9 @@ class Model(nn.Module):
     def __init__(self, M: int, N: int, K: int):
         super().__init__()
         self.M, self.N, self.K = M, N, K
-        # Weights are true fp8_e4m3, stored as parameters so state_dict carries
-        # them across to the agent's solution.
         w = torch.empty(N, K, dtype=torch.bfloat16)
         nn.init.normal_(w, std=0.02)
-        self.weight = nn.Parameter(w.to(torch.float8_e4m3fn))
+        self.register_buffer("weight", w.to(torch.float8_e4m3fn))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Upcast to bf16 for the naive reference; the kernel equivalent would
@@ -26,16 +20,7 @@ class Model(nn.Module):
         return x_bf @ w_bf.T  # (M, N) bf16
 
 
-M = 4096
-N = 4096
-K = 4096
-
-
-def get_inputs():
+def get_inputs(M, K):
     # fp8_e4m3 input; random uniform in [-4, 4] then cast.
     x = (torch.rand(M, K) * 8 - 4).to(torch.float8_e4m3fn)
     return [x]
-
-
-def get_init_inputs():
-    return [M, N, K]
