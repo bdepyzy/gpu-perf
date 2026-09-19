@@ -20,34 +20,44 @@ def _e2m1(nib):
 
 
 @cute.kernel
-def _mxfp4_kernel(x, w_q, w_scales, y):
-    """One thread per output element; dequantize weights on the fly.
+def _mxfp4_kernel(A, B, sfa, sfb, C):
+    """One thread per output element; decode both MXFP4 operands into FP32.
 
-    y[m, n] = sum_k x[m, k] * e2m1(nibble) * 2^(scale_bits - 127)
-    w_q packs two e2m1 codes per byte along K: even K -> low nibble.
+    C[m, n] = sum_k decode(A[m, k]) * sfa[m, k//32]
+                      * decode(B[k, n]) * sfb[k//32, n]
+    A and B pack two E2M1 codes per byte along K: even K -> low nibble.
+    Each scale byte represents 2^(bits - 127); scales use packed 128x4 blocks.
+    The scale indices in the equation above are logical, before packing.
     """
     tidx, _, _ = cute.arch.thread_idx()
     bidx, bidy, _ = cute.arch.block_idx()
 
-    M, N = y.shape
-    K = x.shape[1]
+    M, N = C.shape
+    K = A.shape[1] * 2
     mi = bidy
     ni = bidx * THREADS + tidx
 
     if ni < N:
         acc = cutlass.Float32(0.0)
         for kh in cutlass.range(0, K // 2, 1):
-            byte = w_q[kh, ni]
+            a = A[mi, kh]
+            b = B[kh, ni]
             blk = kh // (BLOCK // 2)
-            s = cute.math.exp2(cutlass.Float32(cutlass.Int32(w_scales[blk, ni])) - 127.0)
-            acc += cutlass.Float32(x[mi, 2 * kh]) * _e2m1(byte & 0xF) * s
-            acc += cutlass.Float32(x[mi, 2 * kh + 1]) * _e2m1(byte >> 4) * s
-        y[mi, ni] = y.element_type(acc)
+            # Each scale block holds 128 rows/columns x 4 scales in 512 bytes.
+            # Within it, rows are interleaved as [row % 32, row // 32, scale % 4].
+            sf_a_offset = (blk // 4) * 512 + (mi % 32) * 16 + ((mi % 128) // 32) * 4 + blk % 4
+            sf_b_offset = (blk // 4) * 512 + (ni % 32) * 16 + ((ni % 128) // 32) * 4 + blk % 4
+            # Before: sfa[mi, blk] and sfb[blk, ni] read linear scales.
+            sa = cute.math.exp2(cutlass.Float32(cutlass.Int32(sfa[mi // 128, sf_a_offset])) - 127.0)
+            sb = cute.math.exp2(cutlass.Float32(cutlass.Int32(sfb[ni // 128, sf_b_offset])) - 127.0)
+            acc += (_e2m1(a & 0xF) * sa) * (_e2m1(b & 0xF) * sb)
+            acc += (_e2m1(a >> 4) * sa) * (_e2m1(b >> 4) * sb)
+        C[mi, ni] = C.element_type(acc)
 
 
 @cute.jit
-def mxfp4(x, w_q, w_scales, y, stream: CUstream):
-    M, N = y.shape
-    _mxfp4_kernel(x, w_q, w_scales, y).launch(
+def mxfp4(A, B, sfa, sfb, C, stream: CUstream):
+    M, N = C.shape
+    _mxfp4_kernel(A, B, sfa, sfb, C).launch(
         grid=(cute.ceil_div(N, THREADS), M, 1), block=(THREADS, 1, 1), stream=stream
     )

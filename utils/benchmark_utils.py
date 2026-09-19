@@ -39,6 +39,8 @@ def create_app(benchmark_file, deps=(), nvcc=False):
             'mkdir -p "$CUDA_HOME/lib64"',
             'ln -s ../lib/libcudart.so.13 "$CUDA_HOME/lib64/libcudart.so"',
         )
+    # Compilation happens in Modal; enable detailed DSL errors in that process.
+    image = image.env({"CUTE_DSL_SHOW_STACKTRACE": "1"})
     image = image.add_local_dir(
         Path(__file__).resolve().parent, str(REMOTE_ROOT / "utils")
     ).add_local_dir(task_dir, str(REMOTE_ROOT / task_dir.name))

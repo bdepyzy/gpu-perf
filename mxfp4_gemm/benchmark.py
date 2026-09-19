@@ -1,49 +1,77 @@
+import modal
 import torch
 from cutlass import cute
 from cutlass.cute.runtime import from_dlpack
 
-from mxfp4_gemm.reference import Model, get_inputs
+from mxfp4_gemm.reference import get_inputs, reference
 from utils import benchmark_utils as bench
 
 SHAPES = bench.GEMM_SHAPES
 
-app = bench.create_app(__file__, ("apache-tvm-ffi==0.1.14",))
+app = bench.create_app(
+    __file__, ("apache-tvm-ffi==0.1.14", "flashinfer-python[cu13]==0.6.18.post1"), nvcc=True
+)
+cache_volume = modal.Volume.from_name("learn-kernels-flashinfer-cache", create_if_missing=True)
 
 
-@app.function(gpu=bench.B200_GPU, timeout=bench.B200_TIMEOUT)
+@app.function(
+    gpu=bench.B200_GPU, timeout=bench.B200_TIMEOUT,
+    volumes={"/root/.cache/flashinfer": cache_volume},
+)
 @torch.no_grad()
 def run(solution_file: str, check: bool = False, shape: int | None = None):
-    torch.backends.cuda.preferred_blas_library("cublas")
-    solution = bench.load("mxfp4_gemm", solution_file)
+    cache_volume.reload()
+    from flashinfer import autotune, mm_fp4
+    from flashinfer.jit import env as jit_env
+    from flashinfer.quantization import block_scale_interleave
+
+    tuning_dir = jit_env.FLASHINFER_WORKSPACE_DIR / "autotune"
+    tuning_dir.mkdir(parents=True, exist_ok=True)
+    solution = bench.load("mxfp4_gemm", solution_file).mxfp4
     rows, speedups = [], []
     for dims in bench.select_shapes(SHAPES, shape):
         M, N, K = dims["M"], dims["N"], dims["K"]
-        model = Model(M, N, K).cuda().eval()
-        torch.manual_seed(2026)
-        x = get_inputs(M, K)[0].cuda()
-        output = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
-        args = tuple(from_dlpack(t, assumed_align=16) for t in (x, model.w_q, model.w_scales, output))
+        A, B, sfa, sfb = get_inputs(M, N, K)
+        C = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+        # Pack once, before timing: each 128x4 scale block occupies 512 bytes.
+        # Each row of these views holds all packed blocks for 128 A rows / B columns.
+        packed_sfa = block_scale_interleave(sfa).reshape(M // 128, -1)
+        packed_sfb = block_scale_interleave(sfb.T.contiguous()).reshape(N // 128, -1)
+        inputs = (A, B, packed_sfa, packed_sfb, C)
+        # C is a fresh CUDA allocation; expose its 32-byte alignment for BF16x16 stores.
+        args = tuple(from_dlpack(t, assumed_align=32 if i == 4 else 16) for i, t in enumerate(inputs))
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        compiled = cute.compile(solution.mxfp4, *args, stream, options="--enable-tvm-ffi")
-        inputs = (x, model.w_q, model.w_scales, output)
+        compiled = cute.compile(solution, *args, stream, options="--enable-tvm-ffi")
         compiled(*inputs)
         torch.cuda.synchronize()
         kernel_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(kernel_graph):
             compiled(*inputs)
+
         # Check replay itself, so a kernel on the wrong stream cannot pass with stale output.
-        output.fill_(float("nan"))
+        C.fill_(float("nan"))
         kernel_graph.replay()
-        expected = model(x)
-        ok, message = bench.compare(expected, output, 0.05)
+        expected = reference(A, B, sfa, sfb)
+        ok, message = bench.compare(expected, C, 0.05)
         if not ok:
             raise RuntimeError(f"{bench.format_shape(dims)} | {message}")
-        weight = model.dequantize()
-        baseline_output = torch.empty_like(output)
-        baseline = lambda: torch.mm(x, weight, out=baseline_output)
+
+        # Both kernels use the same packed bytes; these are only different shape views.
+        baseline_sfa = packed_sfa.reshape(M, K // 32)
+        baseline_sfb = packed_sfb.reshape(N, K // 32).T
+        baseline_output = torch.empty_like(C)
+
+        def baseline():
+            return mm_fp4(A, B, baseline_sfa, baseline_sfb, out=baseline_output,
+                          block_size=32, use_nvfp4=False, backend="cute-dsl")
+
+        tuning_file = tuning_dir / f"mxfp4-b200-{M}-{N}-{K}.json"
+        with autotune(tuning_buckets=(M,), cache=str(tuning_file)):
+            baseline()
         ok, message = bench.compare(expected, baseline(), 0.05)
         if not ok:
-            raise RuntimeError(f"cuBLAS BF16 | {bench.format_shape(dims)} | {message}")
+            raise RuntimeError(f"FlashInfer/CuTe MXFP4 | {bench.format_shape(dims)} | {message}")
+        cache_volume.commit()  # Persist kernels and tuning choices before timing.
         if check:
             print(f"ok | {bench.format_shape(dims)}", flush=True)
             continue
@@ -61,8 +89,9 @@ def run(solution_file: str, check: bool = False, shape: int | None = None):
         return
     footer = ("Geomean", "", "", "", "", bench.format_ratio(bench.geomean(speedups)))
     bench.print_table(f"{torch.cuda.get_device_name()} | mxfp4_gemm",
-                      "cuBLAS BF16: weights dequantized before timing. CUDA graphs, L2 flushed, median of 50, warmup 10.",
-                      ("Shape", "Kernel", "Kernel TFLOPS", "cuBLAS BF16", "cuBLAS TFLOPS", "Speedup"), rows, footer)
+                      "MXFP4 x MXFP4, FP32 accumulation, BF16 output. FlashInfer/CuTe autotuned; preparation excluded. "
+                      "CUDA graphs, L2 flushed, median of 50, warmup 10.",
+                      ("Shape", "Kernel", "Kernel TFLOPS", "FlashInfer/CuTe MXFP4", "Baseline TFLOPS", "Speedup"), rows, footer)
 
 
 @app.local_entrypoint()
