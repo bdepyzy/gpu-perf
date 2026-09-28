@@ -10,3 +10,4 @@ paged_attention/
 topk_bitonic/
 fp6/
 CuTeDSL/
+perf_experiments/

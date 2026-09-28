@@ -8,22 +8,30 @@ from cutlass.utils import HardwareInfo
 
 
 class MxFp4Gemm:
-    def __init__(self, bk=256, stages=3, persistent=True, overlap=True):
-        self.BM = self.BN = 128
+    def __init__(self, bk=256, stages=3, persistent=True, overlap=True, bn=256):
+        self.BM = 128
+        self.BN = bn
         self.BK = bk
         self.num_stages = stages
         self.persistent = persistent
         self.acc_stages = 2 if overlap else 1
         assert bk in (128, 256)
+        assert bn in (128, 256)
         assert stages in (2, 3, 4)
         self.row_bytes = bk // 2
         self.sf_blocks = bk // 128  # One 512-byte scale block covers K=128.
         self.sf_bytes = self.sf_blocks * 512
+        self.b_scale_groups = bn // 128  # B needs one scale block per 128 output columns.
+        self.sfb_bytes = self.b_scale_groups * self.sf_bytes
         self.tma_swizzle = cuda.TensorMapSwizzle.s64b if bk == 128 else cuda.TensorMapSwizzle.s128b
         self.mma_swizzle = prims.Tcgen05SmemSwizzle.SWIZZLE_64B if bk == 128 else prims.Tcgen05SmemSwizzle.SWIZZLE_128B
-        # Two 128-column results overlap by 16 columns, leaving 16 for scales.
-        self.acc_stride = self.BN - 16 if overlap else self.BN
-        self.tmem_cols = 256
+        # BK=256, BN=256 needs 8 A-scale + 16 B-scale TMEM columns.
+        # Round the overlap up to 16 columns so the BF16x16 stores still fit.
+        scale_cols = self.sf_blocks * 4 * (1 + self.b_scale_groups)
+        self.overlap_cols = ((scale_cols + 15) // 16) * 16 if overlap else 0
+        self.acc_stride = self.BN - self.overlap_cols
+        # Before: self.tmem_cols = 256 -- BN=256 already fills that with ONE result.
+        self.tmem_cols = 2 * bn
 
     @cute.jit
     def __call__(self, A, B, sfa, sfb, C, stream: CUstream):
@@ -38,14 +46,15 @@ class MxFp4Gemm:
             stride_order=(1, 0), swizzle=cuda.TensorMapSwizzle.none,
         )
         tma_SFB = cuda.create_tensor_map_tiled_from_view(
-            cute.recast_tensor(sfb, cutlass.Int64), box_dims=(1, self.sf_bytes // 8),
+            # Before: box_dims=(1, self.sf_bytes // 8) loaded only 128 columns' scales.
+            cute.recast_tensor(sfb, cutlass.Int64), box_dims=(self.b_scale_groups, self.sf_bytes // 8),
             stride_order=(1, 0), swizzle=cuda.TensorMapSwizzle.none,
         )
         tiles = cute.ceil_div(M, self.BM) * cute.ceil_div(N, self.BN)
         ctas = tiles
         if cutlass.const_expr(self.persistent):
-            # Up to two resident CTAs per SM; each advances by gridDim.x output tiles.
-            ctas = min(tiles, 2 * HardwareInfo().get_device_multiprocessor_count())
+            # BN=256 uses all 512 TMEM columns, so only one such CTA fits per SM.
+            ctas = min(tiles, (512 // self.tmem_cols) * HardwareInfo().get_device_multiprocessor_count())
         self.mxfp4_kernel(A, C, tma_A, tma_B, tma_SFA, tma_SFB).launch(
             grid=(ctas, 1, 1), block=(6 * 32, 1, 1), stream=stream,
         )
@@ -75,7 +84,8 @@ class MxFp4Gemm:
         sA = cutlass.Array(cutlass.Uint8, self.num_stages * a_bytes, space=cutlass.AddressSpace.smem, alignment=8 * self.row_bytes)
         sB = cutlass.Array(cutlass.Uint8, self.num_stages * b_bytes, space=cutlass.AddressSpace.smem, alignment=8 * self.row_bytes)
         sSFA = cutlass.Array(cutlass.Uint8, self.num_stages * self.sf_bytes, space=cutlass.AddressSpace.smem, alignment=128)
-        sSFB = cutlass.Array(cutlass.Uint8, self.num_stages * self.sf_bytes, space=cutlass.AddressSpace.smem, alignment=128)
+        sSFB = cutlass.Array(cutlass.Uint8, self.num_stages * self.sfb_bytes, space=cutlass.AddressSpace.smem, alignment=128)
+
         full = cutlass.Array(cutlass.Int64, self.num_stages, space=cutlass.AddressSpace.smem, alignment=8)
         empty = cutlass.Array(cutlass.Int64, self.num_stages, space=cutlass.AddressSpace.smem, alignment=8)
         acc_full = cutlass.Array(cutlass.Int64, self.acc_stages, space=cutlass.AddressSpace.smem, alignment=8)
@@ -96,12 +106,15 @@ class MxFp4Gemm:
             prims.prefetch_tensormap(tma_B.get_ptr())
             prims.prefetch_tensormap(tma_SFA.get_ptr())
             prims.prefetch_tensormap(tma_SFB.get_ptr())
+
         if warp == 5:
             # Allocation is warp-collective; all 32 lanes participate.
-            # Result 0: columns 0..127. Result 1: 112..239. Scales: 240..255.
-            # The epilogue reads shared columns 112..127 FIRST, then releases them.
+            # Default BN=BK=256: result 0 is 0..255, result 1 is 224..479.
+            # Their overlap is 224..255; A scales use 480..487, B scales 488..503.
+            # The epilogue reads the overlapping columns FIRST, then releases them.
             prims.tcgen05_alloc(tmem_base, self.tmem_cols)
             prims.tcgen05_relinquish_alloc_permit()
+
         prims.fence_mbarrier_init()
         prims.barrier_cta_sync(0)
         base = tmem_base[0]
@@ -121,7 +134,7 @@ class MxFp4Gemm:
                     if prims.elect_sync():
                         k_start = k_tile * self.BK
                         sf_start = (k_start // 128) * 64  # 64 Int64 packages per scale block.
-                        prims.mbarrier_arrive_expect_tx(full.data_ptr(stage), a_bytes + b_bytes + 2 * self.sf_bytes)
+                        prims.mbarrier_arrive_expect_tx(full.data_ptr(stage), a_bytes + b_bytes + self.sf_bytes + self.sfb_bytes)
                         prims.cp_async_bulk_tensor_shared_cta_global(
                             sA.data_ptr(stage * a_bytes), tma_A.get_ptr(), (k_start // 2, tile_row), full.data_ptr(stage),
                         )
@@ -132,7 +145,7 @@ class MxFp4Gemm:
                             sSFA.data_ptr(stage * self.sf_bytes), tma_SFA.get_ptr(), (sf_start, tile_row // 128), full.data_ptr(stage),
                         )
                         prims.cp_async_bulk_tensor_shared_cta_global(
-                            sSFB.data_ptr(stage * self.sf_bytes), tma_SFB.get_ptr(), (sf_start, tile_col // 128), full.data_ptr(stage),
+                            sSFB.data_ptr(stage * self.sfb_bytes), tma_SFB.get_ptr(), (sf_start, tile_col // 128), full.data_ptr(stage),
                         )
                     stage += 1
                     if stage == self.num_stages:
@@ -174,24 +187,28 @@ class MxFp4Gemm:
                             stride_byte_offset=8 * self.row_bytes, layout=self.mma_swizzle,
                         )
                         sfa_desc = prims.Tcgen05SmemDesc.build(sSFA.data_ptr(stage * self.sf_bytes), stride_byte_offset=8 * 16,)
-                        sfb_desc = prims.Tcgen05SmemDesc.build(sSFB.data_ptr(stage * self.sf_bytes), stride_byte_offset=8 * 16,)
+                        sfb_desc = prims.Tcgen05SmemDesc.build(sSFB.data_ptr(stage * self.sfb_bytes), stride_byte_offset=8 * 16,)
                         for sf_block in cutlass.range_constexpr(self.sf_blocks):
                             sfa_tmem = prims.TmemAddr(sf_base + sf_block * 4).as_ptr(cutlass.Int32)
-                            sfb_tmem = prims.TmemAddr(sf_base + self.sf_blocks * 4 + sf_block * 4).as_ptr(cutlass.Int32)
                             prims.tcgen05_cp(
                                 prims.Tcgen05CpShape.SHAPE_32X128B, sfa_tmem,
                                 sfa_desc.advance_start_address(sf_block * 512), multicast=prims.Tcgen05CpMulticast.WARPX4,
                             )
-                            prims.tcgen05_cp(
-                                prims.Tcgen05CpShape.SHAPE_32X128B, sfb_tmem,
-                                sfb_desc.advance_start_address(sf_block * 512), multicast=prims.Tcgen05CpMulticast.WARPX4,
-                            )
+                            for n_group in cutlass.range_constexpr(self.b_scale_groups):
+                                # SMEM groups by N first. MMA wants both N halves beside
+                                # each other in TMEM for the same K scale block.
+                                sfb_tmem = prims.TmemAddr(sf_base + self.sf_blocks * 4 + (sf_block * self.b_scale_groups + n_group) * 4).as_ptr(cutlass.Int32)
+                                prims.tcgen05_cp(
+                                    prims.Tcgen05CpShape.SHAPE_32X128B, sfb_tmem,
+                                    sfb_desc.advance_start_address(n_group * self.sf_bytes + sf_block * 512),
+                                    multicast=prims.Tcgen05CpMulticast.WARPX4,
+                                )
                         # BK=256 issues four K=64 MMAs but pays the buffer handoff once.
                         for k_mma in cutlass.range_constexpr(self.BK // 64):
                             sf_id = (k_mma % 2) * 2  # Select byte pair 0,1 or 2,3.
                             mma_desc = idesc | (sf_id << 4) | (sf_id << 29)
                             sfa_tmem = prims.TmemAddr(sf_base + (k_mma // 2) * 4).as_ptr(cutlass.Int32)
-                            sfb_tmem = prims.TmemAddr(sf_base + self.sf_blocks * 4 + (k_mma // 2) * 4).as_ptr(cutlass.Int32)
+                            sfb_tmem = prims.TmemAddr(sf_base + self.sf_blocks * 4 + (k_mma // 2) * self.b_scale_groups * 4).as_ptr(cutlass.Int32)
                             prims.tcgen05_mma_block_scale(
                                 prims.Tcgen05MMAKind.MXF4, prims.CTAGroup.CTA_1,
                                 d_tmem, a_desc.advance_start_address(k_mma * 32),
@@ -208,7 +225,7 @@ class MxFp4Gemm:
                     prims.tcgen05_commit(acc_full.data_ptr(acc_stage))
                 if cutlass.const_expr(self.acc_stages == 2):
                     while not prims.mbarrier_try_wait_parity(partial, partial_phase):
-                        pass  # The next result overlaps 16 columns; wait only for those reads.
+                        pass  # Wait until the output warps have read the overlapping columns.
                     partial_phase ^= 1
                 acc_stage += 1
                 if acc_stage == self.acc_stages:
@@ -231,27 +248,29 @@ class MxFp4Gemm:
 
                 prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
                 if cutlass.const_expr(self.acc_stages == 2):
-                    # Both result buffers share these 16 TMEM columns. Drain them first.
-                    addr = prims.TmemAddr.from_row_col(warp * 32, base + self.acc_stride)
-                    values = prims.tcgen05_ld('32x32b', addr.as_ptr(cutlass.Float32), num=16)
-                    prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
-                    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                    prims.mbarrier_arrive(partial)
-                    tmp = cute.make_rmem_tensor(16, cutlass.BFloat16)
-                    tmp.store(cute.TensorSSA(values.to(cutlass.BFloat16).ir_value(), (16,), cutlass.BFloat16))
-                    # These are result 0's last columns, or result 1's first columns.
-                    col = tile_col + (1 - acc_stage) * self.acc_stride
-                    if row < M and col + 16 <= N:
-                        cute.copy(store_bf16x16, tmp, C_vectors[None, (row, col // 16)])
+                    # Before: read just 16 columns. BN=BK=256 shares 32 columns.
+                    for shared_col in cutlass.range_constexpr(0, self.overlap_cols, 16):
+                        addr = prims.TmemAddr.from_row_col(warp * 32, base + self.acc_stride + shared_col)
+                        values = prims.tcgen05_ld('32x32b', addr.as_ptr(cutlass.Float32), num=16)
+                        prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
+                        if cutlass.const_expr(shared_col + 16 == self.overlap_cols):
+                            prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+                            prims.mbarrier_arrive(partial)
+                        tmp = cute.make_rmem_tensor(16, cutlass.BFloat16)
+                        tmp.store(cute.TensorSSA(values.to(cutlass.BFloat16).ir_value(), (16,), cutlass.BFloat16))
+                        # These are result 0's last columns, or result 1's first columns.
+                        col = tile_col + (1 - acc_stage) * self.acc_stride + shared_col
+                        if row < M and col + 16 <= N:
+                            cute.copy(store_bf16x16, tmp, C_vectors[None, (row, col // 16)])
 
                 for col_start in cutlass.range_constexpr(0, self.acc_stride, 16):
-                    # Remaining columns do not overlap: 0..111 or 128..239.
+                    # Default BN=BK=256: remaining columns are 0..223 or 256..479.
                     addr = prims.TmemAddr.from_row_col(warp * 32, base + acc_stage * self.BN + col_start)
                     values = prims.tcgen05_ld('32x32b', addr.as_ptr(cutlass.Float32), num=16)
                     prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
                     tmp = cute.make_rmem_tensor(16, cutlass.BFloat16)
                     tmp.store(cute.TensorSSA(values.to(cutlass.BFloat16).ir_value(), (16,), cutlass.BFloat16))
-                    col = tile_col + col_start + acc_stage * 16
+                    col = tile_col + col_start + acc_stage * self.overlap_cols
                     if row < M and col + 16 <= N:
                         cute.copy(store_bf16x16, tmp, C_vectors[None, (row, col // 16)])
 
