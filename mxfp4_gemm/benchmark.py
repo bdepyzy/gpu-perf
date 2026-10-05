@@ -33,12 +33,11 @@ def run(solution_file: str, check: bool = False, shape: int | None = None):
         M, N, K = dims["M"], dims["N"], dims["K"]
         A, B, sfa, sfb = get_inputs(M, N, K)
         C = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
-        # Pack once, before timing: each 128x4 scale block occupies 512 bytes.
-        # Each row of these views holds all packed blocks for 128 A rows / B columns.
+
         packed_sfa = block_scale_interleave(sfa).reshape(M // 128, -1)
         packed_sfb = block_scale_interleave(sfb.T.contiguous()).reshape(N // 128, -1)
         inputs = (A, B, packed_sfa, packed_sfb, C)
-        # C is a fresh CUDA allocation; expose its 32-byte alignment for BF16x16 stores.
+
         args = tuple(from_dlpack(t, assumed_align=32 if i == 4 else 16) for i, t in enumerate(inputs))
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         compiled = cute.compile(solution, *args, stream, options="--enable-tvm-ffi")
@@ -48,7 +47,6 @@ def run(solution_file: str, check: bool = False, shape: int | None = None):
         with torch.cuda.graph(kernel_graph):
             compiled(*inputs)
 
-        # Check replay itself, so a kernel on the wrong stream cannot pass with stale output.
         C.fill_(float("nan"))
         kernel_graph.replay()
         expected = reference(A, B, sfa, sfb)
@@ -56,7 +54,6 @@ def run(solution_file: str, check: bool = False, shape: int | None = None):
         if not ok:
             raise RuntimeError(f"{bench.format_shape(dims)} | {message}")
 
-        # Both kernels use the same packed bytes; these are only different shape views.
         baseline_sfa = packed_sfa.reshape(M, K // 32)
         baseline_sfb = packed_sfb.reshape(N, K // 32).T
         baseline_output = torch.empty_like(C)
@@ -71,7 +68,7 @@ def run(solution_file: str, check: bool = False, shape: int | None = None):
         ok, message = bench.compare(expected, baseline(), 0.05)
         if not ok:
             raise RuntimeError(f"FlashInfer/CuTe MXFP4 | {bench.format_shape(dims)} | {message}")
-        cache_volume.commit()  # Persist kernels and tuning choices before timing.
+        cache_volume.commit()
         if check:
             print(f"ok | {bench.format_shape(dims)}", flush=True)
             continue

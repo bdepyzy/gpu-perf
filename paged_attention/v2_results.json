@@ -1,0 +1,95 @@
+{
+  "gpu": "NVIDIA B200",
+  "method": "CUDA events; 256 MiB L2 flush; 10 warmups, 30 iterations; median of AB/BA runs",
+  "source_sha256": {
+    "paged_attention.v1": "23a4d4314d82eb6b5e7f3d0cac2cee6d45207c6726c7a316eade24753a93944a",
+    "paged_attention.v2": "606b2791862d72698e4903c9e64a16f60bd5511070c4973485acff5f358837b8"
+  },
+  "geomean_speedup": 1.8305158715595469,
+  "results": [
+    {
+      "shape": {
+        "batch": 8,
+        "num_heads": 32,
+        "num_kv_heads": 8,
+        "head_dim": 128,
+        "seq_len": 1024,
+        "page_size": 16
+      },
+      "v1_us": 101.3919971883297,
+      "v2_us": 46.08000069856644,
+      "speedup": 2.200347127848113,
+      "correct": true
+    },
+    {
+      "shape": {
+        "batch": 32,
+        "num_heads": 32,
+        "num_kv_heads": 8,
+        "head_dim": 128,
+        "seq_len": 2048,
+        "page_size": 16
+      },
+      "v1_us": 334.83199775218964,
+      "v2_us": 240.63999950885773,
+      "speedup": 1.3914228658393295,
+      "correct": true
+    },
+    {
+      "shape": {
+        "batch": 4,
+        "num_heads": 64,
+        "num_kv_heads": 8,
+        "head_dim": 128,
+        "seq_len": 4096,
+        "page_size": 16
+      },
+      "v1_us": 220.15999257564545,
+      "v2_us": 134.17600095272064,
+      "speedup": 1.6408298877026661,
+      "correct": true
+    },
+    {
+      "shape": {
+        "batch": 16,
+        "num_heads": 32,
+        "num_kv_heads": 8,
+        "head_dim": 128,
+        "seq_len": 1535,
+        "page_size": 16
+      },
+      "v1_us": 177.13599652051926,
+      "v2_us": 106.47199861705303,
+      "speedup": 1.6636862162945099,
+      "correct": true
+    },
+    {
+      "shape": {
+        "batch": 8,
+        "num_heads": 16,
+        "num_kv_heads": 4,
+        "head_dim": 64,
+        "seq_len": 2000,
+        "page_size": 16
+      },
+      "v1_us": 95.23200243711472,
+      "v2_us": 50.19199848175049,
+      "speedup": 1.8973542659740976,
+      "correct": true
+    },
+    {
+      "shape": {
+        "batch": 4,
+        "num_heads": 32,
+        "num_kv_heads": 8,
+        "head_dim": 128,
+        "seq_len": 32768,
+        "page_size": 16
+      },
+      "v1_us": 1324.0479826927185,
+      "v2_us": 558.0800175666809,
+      "speedup": 2.372505628253421,
+      "correct": true
+    }
+  ]
+}

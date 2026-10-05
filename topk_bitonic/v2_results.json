@@ -1,0 +1,66 @@
+{
+  "gpu": "NVIDIA B200",
+  "method": "CUDA events; 256 MiB L2 flush; 10 warmups, 30 iterations; median of AB/BA runs",
+  "source_sha256": {
+    "topk_bitonic.v1": "52b3da94a9b717cf456990d819153236b5efd1d5f4bd6ecd2fae9caa7e887a07",
+    "topk_bitonic.v2": "a4390555c7c28eeafce3f37c38f3f9f98de3e882bcfc344c8b469e3957e41997"
+  },
+  "geomean_speedup": 2.9375771523923797,
+  "results": [
+    {
+      "shape": {
+        "batch": 1,
+        "n": 32768,
+        "k": 32
+      },
+      "v1_us": 47.120001167058945,
+      "v2_us": 26.639999821782112,
+      "speedup": 1.7687688244101047,
+      "correct": true
+    },
+    {
+      "shape": {
+        "batch": 1,
+        "n": 131072,
+        "k": 64
+      },
+      "v1_us": 131.1360001564026,
+      "v2_us": 36.99999861419201,
+      "speedup": 3.5442163531893494,
+      "correct": true
+    },
+    {
+      "shape": {
+        "batch": 8,
+        "n": 131072,
+        "k": 64
+      },
+      "v1_us": 165.95999896526337,
+      "v2_us": 53.247999399900436,
+      "speedup": 3.116736794539058,
+      "correct": true
+    },
+    {
+      "shape": {
+        "batch": 32,
+        "n": 131072,
+        "k": 64
+      },
+      "v1_us": 307.20001459121704,
+      "v2_us": 110.59200018644333,
+      "speedup": 2.7777779050321803,
+      "correct": true
+    },
+    {
+      "shape": {
+        "batch": 8,
+        "n": 262144,
+        "k": 64
+      },
+      "v1_us": 292.9680049419403,
+      "v2_us": 72.68800213932991,
+      "speedup": 4.030486412054262,
+      "correct": true
+    }
+  ]
+}

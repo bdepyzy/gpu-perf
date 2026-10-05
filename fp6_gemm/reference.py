@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 
 
-# e3m2: 1 sign, 3 exp (bias 3), 2 mantissa. Subnormals (e=0): m/16.
 LEVELS = (
     0.0, 0.0625, 0.125, 0.1875,
     0.25, 0.3125, 0.375, 0.4375,
@@ -12,11 +11,10 @@ LEVELS = (
     4.0, 5.0, 6.0, 7.0,
     8.0, 10.0, 12.0, 14.0,
     16.0, 20.0, 24.0, 28.0,
-)  # max 28
+)
 
 
 def _pack_fp6(codes: torch.Tensor) -> torch.Tensor:
-    """Pack (K, N) uint8 e3m2 codes in [0,63] into (K//4*3, N) uint8 — 4 codes per 3 bytes."""
     K, N = codes.shape
     assert K % 4 == 0
     c = codes.view(K // 4, 4, N)
@@ -37,12 +35,6 @@ def _unpack_fp6(w_packed: torch.Tensor, K: int) -> torch.Tensor:
 
 
 class Model(nn.Module):
-    """FP6 GEMM: y = x @ dequant(w_fp6). Activations BF16.
-
-    Weights are raw e3m2 (no block scales), packed four codes per three bytes
-    along K.
-    """
-
     def __init__(self, M: int, N: int, K: int):
         super().__init__()
         assert K % 4 == 0
@@ -52,10 +44,10 @@ class Model(nn.Module):
         w_full = torch.randn(K, N, dtype=torch.float32).clamp(-28.0, 28.0)
 
         levels = torch.tensor(LEVELS)
-        idx = w_full.abs().unsqueeze(-1).sub(levels).abs().argmin(-1)  # nearest level
-        codes = ((w_full < 0).to(torch.uint8) << 5) | idx.to(torch.uint8)  # sign<<5 | level
+        idx = torch.bucketize(w_full.abs(), (levels[:-1] + levels[1:]) * 0.5)
+        codes = ((w_full < 0).to(torch.uint8) << 5) | idx.to(torch.uint8)
 
-        self.register_buffer("w_q", _pack_fp6(codes))  # (K//4*3, N) uint8
+        self.register_buffer("w_q", _pack_fp6(codes))
 
     def dequantize(self):
         codes = _unpack_fp6(self.w_q, self.K)

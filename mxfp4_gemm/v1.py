@@ -17,11 +17,11 @@ class MxFp4Gemm:
         assert bk in (128, 256)
         assert stages in (2, 3, 4)
         self.row_bytes = bk // 2
-        self.sf_blocks = bk // 128  # One 512-byte scale block covers K=128.
+        self.sf_blocks = bk // 128
         self.sf_bytes = self.sf_blocks * 512
         self.tma_swizzle = cuda.TensorMapSwizzle.s64b if bk == 128 else cuda.TensorMapSwizzle.s128b
         self.mma_swizzle = prims.Tcgen05SmemSwizzle.SWIZZLE_64B if bk == 128 else prims.Tcgen05SmemSwizzle.SWIZZLE_128B
-        # Two 128-column results overlap by 16 columns, leaving 16 for scales.
+
         self.acc_stride = self.BN - 16 if overlap else self.BN
         self.tmem_cols = 256
 
@@ -31,8 +31,6 @@ class MxFp4Gemm:
         tma_A = cuda.create_tensor_map_tiled_from_view(A, box_dims=(self.BM, self.row_bytes), stride_order=(1, 0), swizzle=self.tma_swizzle,)
         tma_B = cuda.create_tensor_map_tiled_from_view(B, box_dims=(self.row_bytes, self.BN), stride_order=(0, 1), swizzle=self.tma_swizzle,)
 
-        # Scales are already packed by the benchmark. Int64 only groups eight bytes
-        # into each TMA element; it does not change the E8M0 scale values.
         tma_SFA = cuda.create_tensor_map_tiled_from_view(
             cute.recast_tensor(sfa, cutlass.Int64), box_dims=(1, self.sf_bytes // 8),
             stride_order=(1, 0), swizzle=cuda.TensorMapSwizzle.none,
@@ -44,7 +42,6 @@ class MxFp4Gemm:
         tiles = cute.ceil_div(M, self.BM) * cute.ceil_div(N, self.BN)
         ctas = tiles
         if cutlass.const_expr(self.persistent):
-            # Up to two resident CTAs per SM; each advances by gridDim.x output tiles.
             ctas = min(tiles, 2 * HardwareInfo().get_device_multiprocessor_count())
         self.mxfp4_kernel(A, C, tma_A, tma_B, tma_SFA, tma_SFB).launch(
             grid=(ctas, 1, 1), block=(6 * 32, 1, 1), stream=stream,
@@ -70,8 +67,6 @@ class MxFp4Gemm:
         a_bytes = self.BM * self.row_bytes
         b_bytes = self.BN * self.row_bytes
 
-        # TMA and MMA walk the same ring independently. A buffer becomes reusable
-        # only when Tensor Core hardware signals that its reads have finished.
         sA = cutlass.Array(cutlass.Uint8, self.num_stages * a_bytes, space=cutlass.AddressSpace.smem, alignment=8 * self.row_bytes)
         sB = cutlass.Array(cutlass.Uint8, self.num_stages * b_bytes, space=cutlass.AddressSpace.smem, alignment=8 * self.row_bytes)
         sSFA = cutlass.Array(cutlass.Uint8, self.num_stages * self.sf_bytes, space=cutlass.AddressSpace.smem, alignment=128)
@@ -89,7 +84,7 @@ class MxFp4Gemm:
                 prims.mbarrier_init(empty.data_ptr(stage), 1)
             for stage in cutlass.range_constexpr(self.acc_stages):
                 prims.mbarrier_init(acc_full.data_ptr(stage), 1)
-                # All 128 output threads must finish reading before MMA may reuse it.
+
                 prims.mbarrier_init(acc_empty.data_ptr(stage), 128)
             prims.mbarrier_init(partial, 128)
             prims.prefetch_tensormap(tma_A.get_ptr())
@@ -97,9 +92,6 @@ class MxFp4Gemm:
             prims.prefetch_tensormap(tma_SFA.get_ptr())
             prims.prefetch_tensormap(tma_SFB.get_ptr())
         if warp == 5:
-            # Allocation is warp-collective; all 32 lanes participate.
-            # Result 0: columns 0..127. Result 1: 112..239. Scales: 240..255.
-            # The epilogue reads shared columns 112..127 FIRST, then releases them.
             prims.tcgen05_alloc(tmem_base, self.tmem_cols)
             prims.tcgen05_relinquish_alloc_permit()
         prims.fence_mbarrier_init()
@@ -107,20 +99,18 @@ class MxFp4Gemm:
         base = tmem_base[0]
         sf_base = base + (self.acc_stages - 1) * self.acc_stride + self.BN
 
-        if warp == 4:  # Producer: global memory -> shared memory.
+        if warp == 4:
             stage = cutlass.Int32(0)
             phase = cutlass.Int32(0)
             for tile in cutlass.range(cta, tiles, ctas):
                 tile_row = (tile // grid_n) * self.BM
                 tile_col = (tile % grid_n) * self.BN
                 for k_tile in cutlass.range(k_tiles):
-                    # Initial barriers are phase 0, so waiting on parity 1 passes
-                    # immediately on the first use. Later it waits for the last MMA.
                     while not prims.mbarrier_try_wait_parity(empty.data_ptr(stage), phase ^ 1):
                         pass
                     if prims.elect_sync():
                         k_start = k_tile * self.BK
-                        sf_start = (k_start // 128) * 64  # 64 Int64 packages per scale block.
+                        sf_start = (k_start // 128) * 64
                         prims.mbarrier_arrive_expect_tx(full.data_ptr(stage), a_bytes + b_bytes + 2 * self.sf_bytes)
                         prims.cp_async_bulk_tensor_shared_cta_global(
                             sA.data_ptr(stage * a_bytes), tma_A.get_ptr(), (k_start // 2, tile_row), full.data_ptr(stage),
@@ -138,9 +128,8 @@ class MxFp4Gemm:
                     if stage == self.num_stages:
                         stage = 0
                         phase ^= 1
-                    # Do not reset stage/phase between output tiles: the ring keeps running.
 
-        elif warp == 5:  # Consumer: shared A/B + TMEM scales -> TMEM FP32 sums.
+        elif warp == 5:
             stage = cutlass.Int32(0)
             phase = cutlass.Int32(0)
             acc_stage = cutlass.Int32(0)
@@ -153,7 +142,7 @@ class MxFp4Gemm:
             )
             for tile in cutlass.range(cta, tiles, ctas):
                 while not prims.mbarrier_try_wait_parity(acc_empty.data_ptr(acc_stage), acc_phase ^ 1):
-                    pass  # The output warps may still be reading this result buffer.
+                    pass
 
                 prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
                 d_tmem = prims.TmemAddr(base + acc_stage * self.acc_stride).as_ptr(cutlass.Float32)
@@ -162,9 +151,8 @@ class MxFp4Gemm:
                     while not prims.mbarrier_try_wait_parity(full.data_ptr(stage), phase):
                         pass
                     prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-                    
+
                     if prims.elect_sync():
-                        # TMA and MMA use different numeric encodings for the same swizzle.
                         a_desc = prims.Tcgen05SmemDesc.build(
                             sA.data_ptr(stage * a_bytes), leading_byte_offset=16,
                             stride_byte_offset=8 * self.row_bytes, layout=self.mma_swizzle,
@@ -186,9 +174,9 @@ class MxFp4Gemm:
                                 prims.Tcgen05CpShape.SHAPE_32X128B, sfb_tmem,
                                 sfb_desc.advance_start_address(sf_block * 512), multicast=prims.Tcgen05CpMulticast.WARPX4,
                             )
-                        # BK=256 issues four K=64 MMAs but pays the buffer handoff once.
+
                         for k_mma in cutlass.range_constexpr(self.BK // 64):
-                            sf_id = (k_mma % 2) * 2  # Select byte pair 0,1 or 2,3.
+                            sf_id = (k_mma % 2) * 2
                             mma_desc = idesc | (sf_id << 4) | (sf_id << 29)
                             sfa_tmem = prims.TmemAddr(sf_base + (k_mma // 2) * 4).as_ptr(cutlass.Int32)
                             sfb_tmem = prims.TmemAddr(sf_base + self.sf_blocks * 4 + (k_mma // 2) * 4).as_ptr(cutlass.Int32)
@@ -208,14 +196,14 @@ class MxFp4Gemm:
                     prims.tcgen05_commit(acc_full.data_ptr(acc_stage))
                 if cutlass.const_expr(self.acc_stages == 2):
                     while not prims.mbarrier_try_wait_parity(partial, partial_phase):
-                        pass  # The next result overlaps 16 columns; wait only for those reads.
+                        pass
                     partial_phase ^= 1
                 acc_stage += 1
                 if acc_stage == self.acc_stages:
                     acc_stage = 0
                     acc_phase ^= 1
 
-        else:  # Warps 0..3: store the previous result while MMA builds the next.
+        else:
             C_vectors = cute.zipped_divide(C, (1, 16))[(0, None), None]
             store_bf16x16 = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=256,
@@ -231,7 +219,6 @@ class MxFp4Gemm:
 
                 prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
                 if cutlass.const_expr(self.acc_stages == 2):
-                    # Both result buffers share these 16 TMEM columns. Drain them first.
                     addr = prims.TmemAddr.from_row_col(warp * 32, base + self.acc_stride)
                     values = prims.tcgen05_ld('32x32b', addr.as_ptr(cutlass.Float32), num=16)
                     prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
@@ -239,13 +226,12 @@ class MxFp4Gemm:
                     prims.mbarrier_arrive(partial)
                     tmp = cute.make_rmem_tensor(16, cutlass.BFloat16)
                     tmp.store(cute.TensorSSA(values.to(cutlass.BFloat16).ir_value(), (16,), cutlass.BFloat16))
-                    # These are result 0's last columns, or result 1's first columns.
+
                     col = tile_col + (1 - acc_stage) * self.acc_stride
                     if row < M and col + 16 <= N:
                         cute.copy(store_bf16x16, tmp, C_vectors[None, (row, col // 16)])
 
                 for col_start in cutlass.range_constexpr(0, self.acc_stride, 16):
-                    # Remaining columns do not overlap: 0..111 or 128..239.
                     addr = prims.TmemAddr.from_row_col(warp * 32, base + acc_stage * self.BN + col_start)
                     values = prims.tcgen05_ld('32x32b', addr.as_ptr(cutlass.Float32), num=16)
                     prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
@@ -256,13 +242,12 @@ class MxFp4Gemm:
                         cute.copy(store_bf16x16, tmp, C_vectors[None, (row, col // 16)])
 
                 prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                prims.mbarrier_arrive(acc_empty.data_ptr(acc_stage))  # One arrival from each output thread.
+                prims.mbarrier_arrive(acc_empty.data_ptr(acc_stage))
                 acc_stage += 1
                 if acc_stage == self.acc_stages:
                     acc_stage = 0
                     acc_phase ^= 1
 
-        # Only synchronize the entire block after all three warp roles finish.
         prims.barrier_cta_sync(0)
         if warp == 5:
             prims.tcgen05_dealloc(prims.TmemAddr(base).as_ptr(cutlass.Float32), self.tmem_cols)

@@ -12,25 +12,21 @@ class FP8MM:
     def __init__(self, cta):
         self.BM = 128
         self.BN = 128
-        self.BK = 64              # TMA box K extent: 64 fp8 = 64B -> s64b swizzle
-        self.mma_k = 32           # tcgen05 kind::f8f6f4 instruction K
-        self.cta_group = prims.CTAGroup.CTA_2 if cta else prims.CTAGroup.CTA_1  # CTA_2 needs cluster launch + leader-issue + commit mask (TODO)
-        self.threads_per_cta = 192  # 4 epi warps + 1 TMA warp + 1 MMA warp
-        stage_bytes = (self.BM + self.BN) * self.BK  # fp8 = 1B
+        self.BK = 64
+        self.mma_k = 32
+        self.cta_group = prims.CTAGroup.CTA_2 if cta else prims.CTAGroup.CTA_1
+        self.threads_per_cta = 192
+        stage_bytes = (self.BM + self.BN) * self.BK
         self.num_ab_stage = (get_smem_capacity_in_bytes("sm_100") - 4096) // stage_bytes
-
 
     @cute.jit
     def __call__(self, matrix_a, matrix_b, matrix_c):
-        # harness passes A/B as uint8 views; local compile passes fp8 (no-op recast)
         matrix_a = cute.make_tensor(cute.recast_ptr(matrix_a.iterator, dtype=cutlass.Float8E4M3FN), matrix_a.layout)
         matrix_b = cute.make_tensor(cute.recast_ptr(matrix_b.iterator, dtype=cutlass.Float8E4M3FN), matrix_b.layout)
 
         M, K = matrix_a.shape
         N = matrix_b.shape[0]
 
-        # TMA descriptors over K-major (BM, BK) boxes, 64-byte swizzle
-        # stride_order=(1, 0): K mode is innermost (needed with dynamic strides)
         tma_desc_a = create_tensor_map_tiled_from_view(matrix_a, box_dims=(self.BM, self.BK), swizzle=TensorMapSwizzle.s64b, stride_order=(1, 0))
         tma_desc_b = create_tensor_map_tiled_from_view(matrix_b, box_dims=(self.BN, self.BK), swizzle=TensorMapSwizzle.s64b, stride_order=(1, 0))
 
@@ -49,17 +45,15 @@ class FP8MM:
         S = self.num_ab_stage
 
         tx, _, _ = cute.arch.thread_idx()
-        bidx, bidy, _ = cute.arch.block_idx()  # bidx: N-tile, bidy: M-tile
+        bidx, bidy, _ = cute.arch.block_idx()
         warp_id = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         m_tile = bidy * self.BM
         n_tile = bidx * self.BN
 
-        # both A & B are K-major; S stages of one 64-wide K box each
         smem_a = cutlass.Array(cutlass.Float8E4M3FN, (S * self.BM, self.BK), space=cutlass.AddressSpace.smem, alignment=64)
         smem_b = cutlass.Array(cutlass.Float8E4M3FN, (S * self.BN, self.BK), space=cutlass.AddressSpace.smem, alignment=64)
 
-        # per-stage full/empty barriers + their phase bits (in smem: stage is dynamic)
         ab_full_mbar = cutlass.Array(cutlass.Int64, S, space=cutlass.AddressSpace.smem)
         ab_empty_mbar = cutlass.Array(cutlass.Int64, S, space=cutlass.AddressSpace.smem)
         ab_full_phase = cutlass.Array(cutlass.Int64, S, space=cutlass.AddressSpace.smem)
@@ -76,31 +70,23 @@ class FP8MM:
             prims.mbarrier_init(mbar_mma, 1)
         prims.fence_mbarrier_init()
 
-        # buffers start empty: producer's first wait must pass -> empty phase = 1
-        # NOTE: lane 0 of EVERY warp (6 writers), unlike tx==0 (one thread) --
-        # benign here: identical values to the same addresses.
         if tx % 32 == 0:
             for s in range(S):
                 ab_empty_phase.store(1, s)
                 ab_full_phase.store(0, s)
         prims.barrier_cta_sync(0)
 
-        # warp specialization
         is_epi_warp = warp_id < 4
         is_tma_warp = warp_id == 4
         is_tc_warp = warp_id == 5
 
-        # MMA warp allocates the TMEM accumulator; everyone reads the base after
         if is_tc_warp:
             prims.tcgen05_alloc(tmem_ptr_i32, self.BN)
             prims.tcgen05_relinquish_alloc_permit()
         prims.barrier_cta_sync(0)
 
-        # tmem_ptr points to fixed-size 32-bit slots; Int8 simplifies pointer math
         tmem_ptr = prims.make_tmem_ptr(tmem_ptr_i32.load(), cutlass.Int8)
 
-        # c_format: F16=0, F32=1, S32=2 for .kind::f8f6f4
-        # a/b_format: E4M3=0, E5M2=1 for .kind::f8f6f4
         idesc = prims.Tcgen05InstrDesc.build(
             c_dtype=cutlass.Float32,
             a_dtype=cutlass.Float8E4M3FN,
@@ -116,7 +102,6 @@ class FP8MM:
             full_mbar = ab_full_mbar.subview(stage)
             empty_mbar = ab_empty_mbar.subview(stage)
 
-            # TMA warp (producer) 
             if is_tma_warp:
                 prims.setmaxregister(40, prims.SetMaxRegisterAction.DECREASE)
                 prims.bar_warp_sync(cute.arch.FULL_MASK)
@@ -127,11 +112,10 @@ class FP8MM:
                 if prims.elect_sync():
                     sz = tma_desc_a.global_tx_bytes() + tma_desc_b.global_tx_bytes()
                     prims.mbarrier_arrive_expect_tx(full_mbar, sz)
-                    # TMA coordinates are innermost-dim first: (k_off, row_off)
+
                     prims.cp_async_bulk_tensor_shared_cta_global(smem_a_stage, tma_desc_a.get_ptr(), (kt * self.BK, m_tile), full_mbar)
                     prims.cp_async_bulk_tensor_shared_cta_global(smem_b_stage, tma_desc_b.get_ptr(), (kt * self.BK, n_tile), full_mbar)
 
-            # Tensor core warp (consumer) 
             elif is_tc_warp:
                 prims.bar_warp_sync(cute.arch.FULL_MASK)
                 if prims.elect_sync():
@@ -139,11 +123,10 @@ class FP8MM:
                     while not prims.mbarrier_try_wait_parity(full_mbar, full_bit, time_limit=10000000):
                         pass
                     ab_full_phase.store(full_bit ^ 1, stage)
-                    # 64B-swizzled K-major smem descriptors
-                    # stride_byte_offset: 8 rows x 64 columns x 1 byte = 512 bytes
+
                     desc_a = prims.Tcgen05SmemDesc.build(smem_a_stage, leading_byte_offset=0, stride_byte_offset=512, layout=prims.Tcgen05SmemSwizzle.SWIZZLE_64B)
                     desc_b = prims.Tcgen05SmemDesc.build(smem_b_stage, leading_byte_offset=0, stride_byte_offset=512, layout=prims.Tcgen05SmemSwizzle.SWIZZLE_64B)
-                    # K=32 per instruction; first MMA of first box overwrites (no memset)
+
                     for i in cutlass.range_constexpr(self.BK // self.mma_k):
                         prims.tcgen05_mma(
                             prims.Tcgen05MMAKind.F8F6F4,
@@ -152,48 +135,42 @@ class FP8MM:
                             desc_a,
                             desc_b,
                             idesc,
-                            (kt + i) > 0,  # enable_input_d: accumulate after the very first MMA
+                            (kt + i) > 0,
                         )
-                        # advance by 32 bytes (K=32, fp8 = 1B); encoded field drops low 4 bits
+
                         desc_a = desc_a.advance_start_address(self.mma_k * 1)
                         desc_b = desc_b.advance_start_address(self.mma_k * 1)
-                    # free this stage's buffer for the producer
+
                     prims.tcgen05_commit(empty_mbar)
 
-        # signal the epilogue: all K boxes accumulated (single commit, parity 0)
         if is_tc_warp:
             if prims.elect_sync():
                 prims.tcgen05_commit(mbar_mma)
 
-        # Epilogue warps
         if is_epi_warp:
             while not prims.mbarrier_try_wait_parity(mbar_mma, 0, time_limit=10000000): pass
 
-            # 4 warps / 128 threads, one TMEM lane/row each
             tid_in_epi_wg = tx % 128
             warpid_in_epi_wg = warp_id % 4
             tmem_raw_addr = tmem_ptr_i32.load()
 
-            # [15:0] column index, [31:16] lane/row index
             base_col_id = tmem_raw_addr & 0xFFFF
             base_row_id = tmem_raw_addr >> 16
 
-            # 32x32b loads fan one warp across 32 lanes from the warp's base row
             row_id = base_row_id + warpid_in_epi_wg * 32
-            c_row = m_tile + tid_in_epi_wg  # this thread's C row
+            c_row = m_tile + tid_in_epi_wg
 
             tmem_x = 32
             for n in range(0, self.BN, tmem_x):
                 tmem_offset = (row_id << 16) | (base_col_id + n)
                 tmem_addr_ptr = cutlass.inttoptr(tmem_offset, mem_space=cutlass.AddressSpace.tmem, dtype=cutlass.Float32)
-                # 1 f32 per 32-bit slot: no packing, tmem_x registers
+
                 c_f32 = prims.tcgen05_ld(prims.Tcgen05LdStShape.SHAPE_32X32B, tmem_addr_ptr, num=tmem_x, pack=False)
                 c_bf16 = c_f32.to(cutlass.BFloat16)
-                # 64B vector stores break NVVM; emit 16B (max st.global width) chunks
+
                 for j in cutlass.range_constexpr(tmem_x // 8):
                     matrix_c.store(c_bf16[j * 8 : j * 8 + 8], (c_row, n_tile + n + j * 8))
 
-        # Cleanup
         prims.barrier_cta_sync(0)
         if is_tc_warp: prims.tcgen05_dealloc(tmem_ptr, self.BN)
 

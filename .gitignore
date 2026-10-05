@@ -5,9 +5,4 @@
 __pycache__/
 .ruff_cache/
 plan.md
-kda/
-paged_attention/
-topk_bitonic/
-fp6/
 CuTeDSL/
-perf_experiments/

@@ -16,12 +16,11 @@ def get_inputs(M, N, K):
         torch.randn(N, K, dtype=torch.bfloat16, device="cuda"),
         sfLayout=SfLayout.layout_linear,
     )
-    # A is row-major and B is column-major; both pack pairs along K.
+
     return A, B.T, sfa.reshape(M, K // BLOCK), sfb.reshape(N, K // BLOCK).T
 
 
 def dequantize(packed, scales):
-    """Decode K-packed rows and linear E8M0 scales to FP32."""
     codes = torch.stack((packed & 15, packed >> 4), dim=-1).flatten(-2)
     levels = torch.tensor(LEVELS, device=packed.device)
     values = levels[(codes & 7).long()]

@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parent.parent
 REMOTE_ROOT = Path("/workspace")
 B200_GPU = "B200"
 B200_TIMEOUT = 30 * 60
-# Dense tensor-core peaks. Roofline estimates omit launch/dequantization overhead.
+
 B200_PEAK_TFLOPS = {"fp8": 4500.0, "bf16": 2250.0}
 B200_HBM_GBPS = 8000.0
 WARMUP = 10
@@ -39,7 +39,7 @@ def create_app(benchmark_file, deps=(), nvcc=False):
             'mkdir -p "$CUDA_HOME/lib64"',
             'ln -s ../lib/libcudart.so.13 "$CUDA_HOME/lib64/libcudart.so"',
         )
-    # Compilation happens in Modal; enable detailed DSL errors in that process.
+
     image = image.env({"CUTE_DSL_SHOW_STACKTRACE": "1"})
     image = image.add_local_dir(
         Path(__file__).resolve().parent, str(REMOTE_ROOT / "utils")
@@ -100,7 +100,7 @@ def compare(reference, actual, tolerance):
         return False, f"dtype {actual.dtype} != {reference.dtype}"
     if not torch.isfinite(actual).all():
         return False, "output contains NaN or inf"
-    # Absolute tolerance alone can accept an all-zero result for small outputs.
+
     relative = (reference.float() - actual.float()).norm() / reference.float().norm().clamp_min(1e-6)
     if torch.allclose(reference, actual, atol=tolerance, rtol=tolerance) and relative <= tolerance:
         return True, ""
@@ -142,7 +142,6 @@ def _flush_l2():
 
 
 def bench_median(fn, warmup=WARMUP, iters=ITERATIONS, cuda_graph=False):
-    """Median GPU time with cold L2; graph replay excludes Python dispatch gaps."""
     import statistics
     import torch
 
@@ -192,7 +191,6 @@ def format_percent(value):
 
 
 def format_ratio(ratio):
-    """Speedup vs a baseline: 0.Nx when slower, N.Nx when faster."""
     return f"{ratio:.3f}x" if ratio < 0.1 else f"{ratio:.2f}x"
 
 
